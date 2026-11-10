@@ -26,6 +26,10 @@ def generate_csrf(secret_key=None, token_key=None):
     """Generate a CSRF token. The token is cached for a request, so multiple
     calls to this function will generate the same token.
 
+    The cache is scoped to the full policy identity (secret key and field
+    name), so tokens generated for different secrets or field names never
+    collide, even within the same request.
+
     During testing, it might be useful to access the signed token in
     ``g.csrf_token`` and the raw token in ``session['csrf_token']``.
 
@@ -48,7 +52,14 @@ def generate_csrf(secret_key=None, token_key=None):
         message="A field name is required to use CSRF.",
     )
 
-    if field_name not in g:
+    cache = g.get("_csrf_token_cache")
+
+    if cache is None:
+        cache = g._csrf_token_cache = {}
+
+    cache_key = _policy_fingerprint(secret_key, field_name)
+
+    if cache_key not in cache:
         s = URLSafeTimedSerializer(secret_key, salt="wtf-csrf-token")
 
         if field_name not in session:
@@ -60,9 +71,10 @@ def generate_csrf(secret_key=None, token_key=None):
             session[field_name] = hashlib.sha1(os.urandom(64)).hexdigest()
             token = s.dumps(session[field_name])
 
+        cache[cache_key] = token
         setattr(g, field_name, token)
 
-    return g.get(field_name)
+    return cache[cache_key]
 
 
 def validate_csrf(data, secret_key=None, time_limit=None, token_key=None):
@@ -115,6 +127,26 @@ def validate_csrf(data, secret_key=None, time_limit=None, token_key=None):
 
     if not hmac.compare_digest(session[field_name], token):
         raise ValidationError("The CSRF tokens do not match.")
+
+    validated = g.get("_csrf_validated")
+
+    if validated is None:
+        validated = g._csrf_validated = set()
+
+    validated.add(_policy_fingerprint(secret_key, field_name, time_limit))
+
+
+def _policy_fingerprint(secret_key, field_name, time_limit=None):
+    """Identify a CSRF policy by its secret, field name, and time limit.
+
+    The secret is hashed so that caches never store it in plaintext.
+    """
+
+    if isinstance(secret_key, str):
+        secret_key = secret_key.encode()
+
+    digest = hashlib.sha256(secret_key).hexdigest()
+    return (digest, field_name, time_limit)
 
 
 def csrf_meta_tag(name=None, secret_key=None, token_key=None):
@@ -170,8 +202,14 @@ class _FlaskFormCSRF(CSRF):
         )
 
     def validate_csrf_token(self, form, field):
-        if g.get("csrf_valid", False):
-            # already validated by CSRFProtect
+        policy = _policy_fingerprint(
+            self.meta.csrf_secret,
+            self.meta.csrf_field_name,
+            self.meta.csrf_time_limit,
+        )
+
+        if policy in g.get("_csrf_validated", ()):
+            # this exact policy was already validated during this request
             return
 
         try:
