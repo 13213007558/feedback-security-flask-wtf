@@ -18,8 +18,18 @@ from werkzeug.exceptions import BadRequest
 from wtforms import ValidationError
 from wtforms.csrf.core import CSRF
 
-__all__ = ("generate_csrf", "validate_csrf", "csrf_meta_tag", "CSRFProtect")
+__all__ = (
+    "generate_csrf",
+    "validate_csrf",
+    "csrf_meta_tag",
+    "CSRFProtect",
+    "CSRFError",
+    "CSRFMetadataError",
+)
 logger = logging.getLogger(__name__)
+
+# Methods that cannot cause a state change, per RFC 9110.
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 
 
 def generate_csrf(secret_key=None, token_key=None):
@@ -204,6 +214,8 @@ class CSRFProtect:
     def __init__(self, app=None):
         self._exempt_views = set()
         self._exempt_blueprints = set()
+        self._cross_site_views = set()
+        self._cross_site_blueprints = set()
 
         if app:
             self.init_app(app)
@@ -221,6 +233,8 @@ class CSRFProtect:
         app.config.setdefault("WTF_CSRF_META_NAME", "csrf-token")
         app.config.setdefault("WTF_CSRF_TIME_LIMIT", 3600)
         app.config.setdefault("WTF_CSRF_SSL_STRICT", True)
+        app.config.setdefault("WTF_CSRF_FETCH_METADATA", False)
+        app.config.setdefault("WTF_CSRF_FETCH_METADATA_MISSING", "allow")
 
         app.jinja_env.globals["csrf_token"] = generate_csrf
         app.jinja_env.globals["csrf_meta_tag"] = csrf_meta_tag
@@ -282,6 +296,13 @@ class CSRFProtect:
         if request.method not in current_app.config["WTF_CSRF_METHODS"]:
             return
 
+        if current_app.config["WTF_CSRF_FETCH_METADATA"]:
+            reason = self._fetch_metadata_reason()
+
+            if reason is not None:
+                logger.info(reason)
+                self._metadata_error_response(reason)
+
         try:
             validate_csrf(self._get_csrf_token())
         except ValidationError as e:
@@ -309,6 +330,64 @@ class CSRFProtect:
 
         dest = f"{view.__module__}.{view.__name__}"
         return dest in self._exempt_views
+
+    def _is_cross_site_allowed(self):
+        blueprint = current_app.blueprints.get(request.blueprint)
+
+        if blueprint in self._cross_site_blueprints:
+            return True
+
+        view = current_app.view_functions.get(request.endpoint)
+        if view is None:
+            return False
+
+        dest = f"{view.__module__}.{view.__name__}"
+        return dest in self._cross_site_views
+
+    def _fetch_metadata_reason(self):
+        """Return a rejection reason based on the Fetch Metadata headers.
+
+        Only requests for a protected, state-changing method reach this point;
+        safe methods are allowed before any metadata evaluation. A ``None``
+        result means the request proceeds to the regular CSRF token check.
+        """
+
+        if self._is_cross_site_allowed():
+            return None
+
+        site = request.headers.get("Sec-Fetch-Site")
+
+        if site is None:
+            if current_app.config["WTF_CSRF_FETCH_METADATA_MISSING"] == "reject":
+                return "The Sec-Fetch-Site header is missing."
+
+            return None
+
+        site = site.lower()
+
+        if site in {"same-origin", "same-site"}:
+            # Fetch Metadata identifies the context, it does not authenticate
+            # the request, so the CSRF token is still required.
+            return None
+
+        if site == "none":
+            if request.method in _SAFE_METHODS:
+                return None
+
+            return "Cross-site state-changing request rejected by Fetch Metadata."
+
+        if site == "cross-site":
+            is_navigation = (
+                request.headers.get("Sec-Fetch-Mode", "").lower() == "navigate"
+                and request.headers.get("Sec-Fetch-Dest", "").lower() == "document"
+            )
+
+            if is_navigation and request.method in _SAFE_METHODS:
+                return None
+
+            return "Cross-site state-changing request rejected by Fetch Metadata."
+
+        return "The Sec-Fetch-Site header has an unrecognized value."
 
     def exempt(self, view):
         """Mark a view or blueprint to be excluded from CSRF protection.
@@ -339,8 +418,41 @@ class CSRFProtect:
         self._exempt_views.add(view_location)
         return view
 
+    def allow_cross_site(self, view):
+        """Mark a view or blueprint as an accepted cross-site entry point.
+
+        Fetch Metadata protection will not reject requests to the target based
+        on ``Sec-Fetch-Site``; every other CSRF check, including the token,
+        still applies unless the target is also :meth:`exempt`. ::
+
+            @app.route('/webhook', methods=['POST'])
+            @csrf.allow_cross_site
+            def webhook():
+                ...
+
+        ::
+
+            bp = Blueprint(...)
+            csrf.allow_cross_site(bp)
+        """
+
+        if isinstance(view, Blueprint):
+            self._cross_site_blueprints.add(view)
+            return view
+
+        if isinstance(view, str):
+            view_location = view
+        else:
+            view_location = ".".join((view.__module__, view.__name__))
+
+        self._cross_site_views.add(view_location)
+        return view
+
     def _error_response(self, reason):
         raise CSRFError(reason)
+
+    def _metadata_error_response(self, reason):
+        raise CSRFMetadataError(reason)
 
 
 class CSRFError(BadRequest):
@@ -352,6 +464,18 @@ class CSRFError(BadRequest):
     """
 
     description = "CSRF validation failed."
+
+
+class CSRFMetadataError(CSRFError):
+    """Raise if a request is rejected by the Fetch Metadata policy before the
+    request body is read.
+
+    Subclassing :class:`CSRFError` keeps existing ``CSRFError`` handlers
+    working, while a dedicated handler can distinguish a metadata policy
+    rejection from an invalid or missing token.
+    """
+
+    description = "Fetch Metadata policy rejected the request."
 
 
 def same_origin(current_uri, compare_uri):

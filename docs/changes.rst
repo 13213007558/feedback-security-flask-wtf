@@ -8,6 +8,13 @@ Unreleased
 
 - Require Flask >= 3.0, Werkzeug >= 3.0, WTForms >= 3.0 and
   ItsDangerous >= 2.1.2.
+- Add an optional Fetch Metadata policy to ``CSRFProtect``. Enable it with the
+  ``WTF_CSRF_FETCH_METADATA`` setting to reject obvious cross-site
+  state-changing requests from the ``Sec-Fetch-Site`` header before the request
+  body is parsed. ``WTF_CSRF_FETCH_METADATA_MISSING`` controls requests without
+  the header, ``allow_cross_site`` declares accepted cross-site entry points,
+  and ``CSRFMetadataError`` distinguishes metadata rejections from token
+  failures.
 
 Version 1.3.0
 -------------

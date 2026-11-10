@@ -36,6 +36,9 @@ CSRF Protection
 .. autoclass:: CSRFError
     :members:
 
+.. autoclass:: CSRFMetadataError
+    :members:
+
 .. autofunction:: generate_csrf
 
 .. autofunction:: validate_csrf

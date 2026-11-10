@@ -28,6 +28,17 @@ Configuration
 ``WTF_CSRF_SSL_STRICT``    Whether to enforce the same origin policy by checking
                            that the referrer matches the host. Only applies to
                            HTTPS requests. Default is ``True``.
+``WTF_CSRF_FETCH_METADATA`` Whether to apply a Fetch Metadata policy before the
+                           CSRF token check. When enabled, obvious cross-site
+                           state-changing requests are rejected from the
+                           ``Sec-Fetch-Site`` request header without reading the
+                           request body. Default is ``False``.
+``WTF_CSRF_FETCH_METADATA_MISSING`` What to do when ``Sec-Fetch-Site`` is not
+                           sent, usually because the client is an older browser
+                           or a non-browser caller. ``'allow'`` (the default)
+                           falls through to the normal CSRF token check;
+                           ``'reject'`` refuses the request before the body is
+                           read.
 ``WTF_I18N_ENABLED``       Set to ``False`` to disable Flask-Babel I18N support.
                            Also set to ``False`` if you want to use WTForms's
                            built-in messages directly, see more info `here`_.

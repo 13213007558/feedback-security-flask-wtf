@@ -112,6 +112,55 @@ Using Axios, configure the default header once at startup:
     axios.defaults.headers.common["X-CSRFToken"] =
         document.querySelector('meta[name="csrf-token"]').content;
 
+Reject cross-site requests early with Fetch Metadata
+-----------------------------------------------------
+
+Without any extra header, a cross-site form submission reaches the token check
+only after the whole request body, including large multipart uploads, has been
+parsed. Modern browsers send `Fetch Metadata`_ headers such as
+``Sec-Fetch-Site``, which identify the request context before the body is read.
+Enable an optional pre-token policy with
+``WTF_CSRF_FETCH_METADATA = True`` to reject obvious cross-site write requests
+up front.
+
+The policy only runs for the methods in ``WTF_CSRF_METHODS``; safe methods
+(``GET``, ``HEAD``, ``OPTIONS``, ``TRACE``) are always allowed. The
+``Sec-Fetch-Site`` value is handled as follows:
+
+- ``same-origin`` and ``same-site`` proceed to the normal CSRF token check.
+  The header identifies the browsing context, it does not authenticate the
+  request, so ``same-site`` is never an automatic token exemption.
+- ``none`` is accepted for safe requests, for example a top-level URL typed by
+  the user, and rejected for state-changing requests.
+- ``cross-site`` is rejected, including top-level form-submission navigations,
+  except for safe top-level document navigations.
+- An unrecognized value is rejected.
+- A missing header means the client may be an older browser or a non-browser
+  caller. By default such requests fall through to the token check
+  (``WTF_CSRF_FETCH_METADATA_MISSING = 'allow'``); set it to ``'reject'`` to
+  refuse them before the body is read.
+
+These headers cannot prove that a non-browser caller is trustworthy, since any
+client can send arbitrary header values. They are an additional layer in front
+of the token check, not a replacement for it.
+
+A cross-site entry point that is expected to receive browser writes can be
+declared with :meth:`~flask_wtf.csrf.CSRFProtect.allow_cross_site`. The target
+skips the metadata decision but still goes through every other CSRF check; use
+:meth:`~flask_wtf.csrf.CSRFProtect.exempt` as before to opt out completely. ::
+
+    @app.route('/webhook', methods=['POST'])
+    @csrf.allow_cross_site
+    def webhook():
+        ...
+
+A metadata rejection raises :class:`CSRFMetadataError`, a subclass of
+:class:`CSRFError`. Existing ``CSRFError`` handlers keep working, while a
+dedicated handler can tell metadata rejections apart from invalid or missing
+tokens.
+
+.. _Fetch Metadata: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-Fetch-Site
+
 Customize the error response
 ----------------------------
 
