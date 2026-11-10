@@ -202,7 +202,15 @@ class CSRFProtect:
     """
 
     def __init__(self, app=None):
+        # Exempt view function objects, matched by identity. This avoids
+        # accidental sharing when two distinct views report the same
+        # ``__module__.__name__`` (e.g. decorators using ``functools.wraps``).
         self._exempt_views = set()
+        # Exempt endpoint names, matched exactly against ``request.endpoint``.
+        self._exempt_endpoints = set()
+        # Exempt Blueprint objects, matched by identity. Registering the same
+        # blueprint under several names exempts all of them, while another
+        # blueprint with the same name stays protected.
         self._exempt_blueprints = set()
 
         if app:
@@ -266,10 +274,15 @@ class CSRFProtect:
     def protect(self, apply_exemptions=False):
         """Validate CSRF on the current request.
 
-        When ``apply_exemptions`` is ``True``, views and blueprints marked with
-        :meth:`exempt` are skipped. This lets you combine a custom
+        When ``apply_exemptions`` is ``True``, the view, endpoint, and
+        blueprint exemptions registered with :meth:`exempt` are evaluated
+        against the endpoint selected by real URL matching, and matching
+        requests are skipped. This lets you combine a custom
         ``before_request`` hook (or any manual call) with the declarative
         ``@csrf.exempt`` decorator.
+
+        Exemptions are never applied when this is called without the flag,
+        so a manual call always validates unless the caller opts in.
         """
 
         if apply_exemptions:
@@ -300,18 +313,39 @@ class CSRFProtect:
         g.csrf_valid = True  # mark this request as CSRF valid
 
     def _is_exempt(self):
+        # Blueprint scope: the blueprint handling the matched request, found
+        # through the current app so blueprint aliases resolve to the same
+        # Blueprint object.
         if current_app.blueprints.get(request.blueprint) in self._exempt_blueprints:
             return True
 
-        view = current_app.view_functions.get(request.endpoint)
-        if view is None:
-            return False
+        # Endpoint scope: the endpoint name chosen by real URL matching.
+        if request.endpoint in self._exempt_endpoints:
+            return True
 
-        dest = f"{view.__module__}.{view.__name__}"
-        return dest in self._exempt_views
+        # View scope: the exact view function registered for this endpoint.
+        # Identity matching ignores ``__name__`` collisions; a wrapper applied
+        # outside ``@csrf.exempt`` is a different object and stays protected.
+        view = current_app.view_functions.get(request.endpoint)
+        return view is not None and view in self._exempt_views
 
     def exempt(self, view):
-        """Mark a view or blueprint to be excluded from CSRF protection.
+        """Mark a view, endpoint, or blueprint to be excluded from CSRF
+        protection.
+
+        The three argument types have distinct, non-overlapping scopes:
+
+        - A view function (the usual ``@csrf.exempt`` decorator) exempts that
+          exact function object. If it is registered on several endpoints,
+          every endpoint serving it is exempt; another view with the same
+          ``__module__.__name__`` is not affected, even when
+          :func:`functools.wraps` copies the name.
+        - A string exempts one endpoint name, as resolved by real URL
+          matching (for example ``'account.login'``). Only that endpoint is
+          exempt, in every app this ``CSRFProtect`` is initialized on.
+        - A :class:`~flask.Blueprint` exempts every endpoint of that
+          blueprint, including when the same blueprint is registered under
+          different names.
 
         ::
 
@@ -319,6 +353,10 @@ class CSRFProtect:
             @csrf.exempt
             def some_view():
                 ...
+
+        ::
+
+            csrf.exempt('account.login')
 
         ::
 
@@ -332,11 +370,10 @@ class CSRFProtect:
             return view
 
         if isinstance(view, str):
-            view_location = view
-        else:
-            view_location = ".".join((view.__module__, view.__name__))
+            self._exempt_endpoints.add(view)
+            return view
 
-        self._exempt_views.add(view_location)
+        self._exempt_views.add(view)
         return view
 
     def _error_response(self, reason):

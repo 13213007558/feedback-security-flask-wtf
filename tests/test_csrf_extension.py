@@ -1,3 +1,5 @@
+import functools
+
 import pytest
 from flask import Blueprint
 from flask import g
@@ -166,7 +168,8 @@ def test_exempt_view(app, csrf, client):
     response = client.post("/exempt")
     assert response.status_code == 200
 
-    csrf.exempt("test_csrf_extension.index")
+    # A string is an endpoint name, resolved through real URL matching.
+    csrf.exempt("index")
     response = client.post("/")
     assert response.status_code == 200
 
@@ -269,3 +272,213 @@ def test_validate_error_logged(client, monkeypatch):
     client.post("/")
     assert len(messages) == 1
     assert messages[0] == "The CSRF token is missing."
+
+
+def test_exempt_view_follows_view_onto_every_endpoint(app, csrf, client):
+    @csrf.exempt
+    def shared():
+        pass
+
+    app.add_url_rule("/one", endpoint="one", view_func=shared, methods=["POST"])
+    app.add_url_rule("/two", endpoint="two", view_func=shared, methods=["POST"])
+
+    assert client.post("/one").status_code == 200
+    assert client.post("/two").status_code == 200
+
+
+def test_exempt_endpoint_only_matches_that_endpoint(app, csrf, client):
+    def shared():
+        pass
+
+    app.add_url_rule("/one", endpoint="one", view_func=shared, methods=["POST"])
+    app.add_url_rule("/two", endpoint="two", view_func=shared, methods=["POST"])
+    csrf.exempt("one")
+
+    assert client.post("/one").status_code == 200
+    assert client.post("/two").status_code == 400
+
+
+def test_exempt_unknown_endpoint_does_not_match(app, csrf, client):
+    csrf.exempt("does.not_exist")
+
+    response = client.post("/")
+    assert response.status_code == 400
+
+
+def test_same_name_wrappers_do_not_share_exemption(app, csrf, client):
+    def named_wrapper(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        wrapper.__name__ = "colliding_name"
+        return wrapper
+
+    @app.route("/exempt", endpoint="exempt_ep", methods=["POST"])
+    @csrf.exempt
+    @named_wrapper
+    def exempt_view():
+        pass
+
+    @app.route("/protected", endpoint="protected_ep", methods=["POST"])
+    @named_wrapper
+    def protected_view():
+        pass
+
+    assert exempt_view.__name__ == protected_view.__name__ == "colliding_name"
+    assert client.post("/exempt").status_code == 200
+    assert client.post("/protected").status_code == 400
+
+
+def test_wrapper_outside_exempt_stays_protected(app, csrf, client):
+    def plain_wrapper(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    @csrf.exempt
+    def inner():
+        pass
+
+    app.add_url_rule(
+        "/wrapped",
+        endpoint="wrapped",
+        view_func=plain_wrapper(inner),
+        methods=["POST"],
+    )
+
+    # The registered view is the wrapper, not the object passed to exempt.
+    assert app.view_functions["wrapped"] is not inner
+    assert client.post("/wrapped").status_code == 400
+
+    # Endpoint exemption is the precise escape hatch for this layout.
+    csrf.exempt("wrapped")
+    assert client.post("/wrapped").status_code == 200
+
+
+def test_exempt_blueprint_object_ignores_registration_names(app, csrf, client):
+    bp = Blueprint("bp", __name__)
+
+    @bp.route("/", methods=["POST"])
+    def index():
+        pass
+
+    csrf.exempt(bp)
+    app.register_blueprint(bp, url_prefix="/first", name="first")
+    app.register_blueprint(bp, url_prefix="/second", name="second")
+
+    assert client.post("/first/").status_code == 200
+    assert client.post("/second/").status_code == 200
+
+
+def test_same_blueprint_name_different_object_stays_protected(app, csrf, client):
+    exempt_bp = Blueprint("same_name", __name__)
+    other_bp = Blueprint("same_name", __name__)
+
+    @exempt_bp.route("/", methods=["POST"])
+    def exempt_index():
+        pass
+
+    @other_bp.route("/", methods=["POST"])
+    def other_index():
+        pass
+
+    csrf.exempt(exempt_bp)
+    app.register_blueprint(exempt_bp, url_prefix="/exempt", name="exempt_bp")
+    app.register_blueprint(other_bp, url_prefix="/other", name="other_bp")
+
+    assert client.post("/exempt/").status_code == 200
+    assert client.post("/other/").status_code == 400
+
+
+def test_exemptions_are_scoped_per_app(app, csrf):
+    other = app.__class__("other")
+    other.secret_key = app.secret_key
+    csrf.init_app(other)
+
+    @csrf.exempt
+    def shared_view():
+        pass
+
+    app.add_url_rule("/a", endpoint="a", view_func=shared_view, methods=["POST"])
+    other.add_url_rule("/a", endpoint="a", view_func=shared_view, methods=["POST"])
+    csrf.exempt("only_here")
+
+    def only_view():
+        pass
+
+    app.add_url_rule(
+        "/only", endpoint="only_here", view_func=only_view, methods=["POST"]
+    )
+    other.add_url_rule(
+        "/only", endpoint="only_here", view_func=only_view, methods=["POST"]
+    )
+
+    bp = Blueprint("bp", __name__)
+
+    @bp.route("/", methods=["POST"])
+    def bp_index():
+        pass
+
+    csrf.exempt(bp)
+    app.register_blueprint(bp, url_prefix="/bp", name="bp")
+    other.register_blueprint(bp, url_prefix="/bp", name="bp")
+
+    def local_view():
+        pass
+
+    other.add_url_rule(
+        "/local", endpoint="local_endpoint", view_func=local_view, methods=["POST"]
+    )
+
+    first_client = app.test_client()
+    second_client = other.test_client()
+
+    # View and blueprint exemptions follow the shared objects everywhere.
+    assert first_client.post("/a").status_code == 200
+    assert second_client.post("/a").status_code == 200
+    assert first_client.post("/bp/").status_code == 200
+    assert second_client.post("/bp/").status_code == 200
+    # Endpoint names are compared per app against the shared exemption set.
+    assert first_client.post("/only").status_code == 200
+    assert second_client.post("/only").status_code == 200
+    # A view never registered as exempt stays protected in the second app.
+    assert second_client.post("/local").status_code == 400
+
+
+def test_init_app_twice_keeps_exemptions(app, csrf, client):
+    @app.route("/twice", methods=["POST"])
+    @csrf.exempt
+    def twice():
+        pass
+
+    csrf.init_app(app)
+
+    assert app.extensions["csrf"] is csrf
+    assert client.post("/twice").status_code == 200
+    # Default protection still runs for non-exempt views.
+    assert client.post("/").status_code == 400
+
+
+def test_manual_protect_ignores_exemptions_by_default(app, csrf, client):
+    @app.route("/manual-exempt", methods=["POST"])
+    @csrf.exempt
+    def manual_exempt():
+        csrf.protect()
+
+    assert client.post("/manual-exempt").status_code == 400
+
+
+def test_unknown_endpoint_with_apply_exemptions(app, csrf, client):
+    app.config["WTF_CSRF_CHECK_DEFAULT"] = False
+
+    @app.before_request
+    def manual():
+        csrf.protect(apply_exemptions=True)
+
+    csrf.exempt("missing")
+
+    assert client.post("/missing").status_code == 404
+    assert client.post("/").status_code == 400

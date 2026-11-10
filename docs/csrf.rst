@@ -138,6 +138,48 @@ needed, you can exclude some views using a decorator. ::
         # ...
         return 'ok'
 
+Exemption scopes
+~~~~~~~~~~~~~~~~
+
+:meth:`~flask_wtf.csrf.CSRFProtect.exempt` accepts three kinds of arguments,
+each with a precise scope. Matching always happens against the endpoint
+selected by real URL matching during the request, never against a name lookup
+at registration time.
+
+- **View function** (the decorator form above): the exact function object is
+  exempt, identified by object identity rather than its
+  ``__module__.__name__`` string. Register the same function on several
+  endpoints and every endpoint serving it is exempt. Two different functions
+  that end up with the same name -- two wrappers built with
+  :func:`functools.wraps`, for example -- never share an exemption.
+- **Endpoint name** (a string): pass an endpoint such as
+  ``csrf.exempt('account.login')`` and only that endpoint is exempt. An
+  unknown or not-yet-registered name matches nothing.
+- **Blueprint** (a :class:`~flask.Blueprint` object): every endpoint of that
+  blueprint object is exempt, including when the same blueprint is registered
+  on an app under several names. A different blueprint object that happens to
+  share a name is not affected.
+
+Because view exemptions track the registered object, apply the decorator to
+the view Flask actually registers. Place it directly under the route
+decorator::
+
+    @app.route('/foo', methods=['POST'])
+    @csrf.exempt
+    def foo():
+        ...
+
+If another decorator wraps the view *outside* ``@csrf.exempt``, Flask
+registers the wrapper instead, so the view stays protected. Either move
+``@csrf.exempt`` outermost or exempt the endpoint by name::
+
+    csrf.exempt('foo')
+
+When one ``CSRFProtect`` instance is initialized on several apps, view and
+blueprint exemptions follow the shared function and blueprint objects into
+every app; endpoint-name exemptions are evaluated independently against each
+app's URL map.
+
 You can exclude all the views of a blueprint. ::
 
     csrf.exempt(account_blueprint)
@@ -153,7 +195,8 @@ pre-processing on the requests before checking for the CSRF token. ::
             csrf.protect()
 
 Pass ``apply_exemptions=True`` to keep ``@csrf.exempt`` working in this mode.
-The call will skip validation for views and blueprints marked as exempt. ::
+The call will skip validation for views, endpoints and blueprints marked as
+exempt. A manual ``protect()`` without the flag never applies exemptions. ::
 
     @app.before_request
     def check_csrf():

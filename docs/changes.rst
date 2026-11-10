@@ -8,6 +8,29 @@ Unreleased
 
 - Require Flask >= 3.0, Werkzeug >= 3.0, WTForms >= 3.0 and
   ItsDangerous >= 2.1.2.
+- Rework CSRF exemption identity so exemptions no longer key on the
+  ``view.__module__ + view.__name__`` string. View exemptions now track the
+  exact view function object, string exemptions name an endpoint, and
+  blueprint exemptions track the exact ``Blueprint`` object. Exemption checks
+  run against the endpoint selected by real URL matching.
+  Two views that shared a name (for example wrappers using
+  ``functools.wraps``) no longer inherit each other's exemption.
+
+  Migration notes -- configurations that relied on name collisions may find
+  views now protected instead of silently exempt:
+
+  - ``csrf.exempt('module.path.view_name')`` previously matched any view whose
+    ``__module__.__name__`` equaled that string. Strings are now endpoint
+    names (as used by ``url_for``), so pass the endpoint instead, e.g.
+    ``csrf.exempt('account.login')``.
+  - A view wrapped by another decorator applied *outside*
+    ``@csrf.exempt`` is no longer exempt through a copied ``__name__``;
+    register the exemption on the outer view or exempt its endpoint by name.
+  - Two distinct view functions or blueprints that happened to share a name no
+    longer share an exemption. Exempt each object (or endpoint) explicitly.
+  - Exempting an endpoint name that does not exist in an app has no effect;
+    previously a dotted string could still match an unrelated same-named
+    view.
 
 Version 1.3.0
 -------------
